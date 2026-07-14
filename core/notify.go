@@ -43,7 +43,7 @@ func (s *Scheduler) notifyWorkflow(wjID int64, event, verb string) {
 		// / "Praetor workflow approval ...") and tags the webhook body.
 		kind := "workflow"
 		switch event {
-		case "approval", "approved", "denied":
+		case "approval", "approved", "denied", "timeout":
 			kind = "workflow approval"
 		}
 		for _, r := range rows {

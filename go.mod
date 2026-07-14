@@ -11,13 +11,13 @@ require (
 	github.com/praetordev/env v0.1.0
 	github.com/praetordev/eventbus v0.1.0
 	github.com/praetordev/events v0.1.0
-	github.com/praetordev/launch v0.1.0
+	github.com/praetordev/launch v0.1.1
 	github.com/praetordev/metrics v0.1.0
 	github.com/praetordev/models v0.2.0
 	github.com/praetordev/notify v0.1.0
 	github.com/praetordev/objectstore v0.1.1
 	github.com/praetordev/plog v0.1.0
-	github.com/praetordev/store v0.1.1
+	github.com/praetordev/store v0.1.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/teambition/rrule-go v1.8.2
 )

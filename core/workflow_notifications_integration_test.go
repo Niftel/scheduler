@@ -19,7 +19,7 @@ import (
 // TestWorkflowNotificationsFire proves the scheduler dispatches every workflow
 // notification event exactly where its transition happens: 'started' on first
 // advance, 'approval' when an approval node starts waiting, 'approved'/'denied' on
-// the approval outcome, and 'success'/'error' on terminal finalize. It stands up a
+// a human outcome, 'timeout' on expiry, and 'success'/'error' on terminal finalize. It stands up a
 // real HTTP receiver (the webhook backend) and asserts each delivery carries the
 // right event + workflow kind.
 //
@@ -80,7 +80,7 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 		 VALUES ($1,'gate','approval','the gate')`, wtID); err != nil {
 		t.Fatalf("insert approval node: %v", err)
 	}
-	for _, ev := range []string{"started", "success", "error", "approval", "approved", "denied"} {
+	for _, ev := range []string{"started", "success", "error", "approval", "approved", "denied", "timeout"} {
 		if _, err := db.Exec(
 			`INSERT INTO workflow_template_notifications (workflow_template_id, notification_template_id, event)
 			 VALUES ($1,$2,$3)`, wtID, ntID, ev); err != nil {
@@ -162,6 +162,40 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 	expect(t, "denied", "workflow approval")
 	expect(t, "error", "workflow")
 	assertWFStatus(t, db, wjB, "failed")
+
+	// --- Timeout path: the run snapshot carries the template policy. Moving the
+	// durable waiting timestamp into the past lets the next scheduler tick expire
+	// it through the configured success path, with no human decision actor. ---
+	if _, err := db.Exec(`UPDATE workflow_nodes SET approval_timeout_seconds=1, approval_timeout_action='approved' WHERE workflow_template_id=$1 AND node_key='gate'`, wtID); err != nil {
+		t.Fatalf("configure approval timeout: %v", err)
+	}
+	seen = map[string]string{}
+	wjC, err := launch.Workflow(ctx, db, wtID, launch.Options{})
+	if err != nil {
+		t.Fatalf("launch.Workflow C: %v", err)
+	}
+	advance(t, wjC, "C start")
+	expect(t, "started", "workflow")
+	expect(t, "approval", "workflow approval")
+	if _, err := db.Exec(`UPDATE workflow_job_nodes SET awaiting_since=now()-interval '2 seconds' WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
+		t.Fatalf("age approval gate: %v", err)
+	}
+	advance(t, wjC, "C timeout")
+	expect(t, "timeout", "workflow approval")
+	expect(t, "success", "workflow")
+	assertWFStatus(t, db, wjC, "successful")
+	var audit struct {
+		Status    string     `db:"status"`
+		TimedOut  bool       `db:"timed_out"`
+		DecidedAt *time.Time `db:"decided_at"`
+		DecidedBy *int64     `db:"decided_by_user_id"`
+	}
+	if err := db.Get(&audit, `SELECT status,timed_out,decided_at,decided_by_user_id FROM workflow_job_nodes WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
+		t.Fatalf("read timeout audit: %v", err)
+	}
+	if audit.Status != "approved" || !audit.TimedOut || audit.DecidedAt == nil || audit.DecidedBy != nil {
+		t.Fatalf("unexpected timeout audit: %+v", audit)
+	}
 }
 
 func assertWFStatus(t *testing.T, db *sqlx.DB, wjID int64, want string) {
