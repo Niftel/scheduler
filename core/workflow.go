@@ -65,16 +65,20 @@ func (s *Scheduler) advanceWorkflowLocked(ctx context.Context, id int64) {
 }
 
 type wfNode struct {
-	ID            int64  `db:"id"`
-	NodeKey       string `db:"node_key"`
-	NodeType      string `db:"node_type"`
-	Name          string `db:"name"`
-	Status        string `db:"status"`
-	JobTemplateID *int64 `db:"job_template_id"`
-	UnifiedJobID  *int64 `db:"unified_job_id"`
-	WebhookURL    string `db:"webhook_url"`  // webhook_out: URL to POST
-	WebhookBody   string `db:"webhook_body"` // webhook_out: optional JSON body
-	EventToken    string `db:"event_token"`  // webhook_in: per-run callback secret
+	ID                     int64      `db:"id"`
+	NodeKey                string     `db:"node_key"`
+	NodeType               string     `db:"node_type"`
+	Name                   string     `db:"name"`
+	Status                 string     `db:"status"`
+	JobTemplateID          *int64     `db:"job_template_id"`
+	UnifiedJobID           *int64     `db:"unified_job_id"`
+	WebhookURL             string     `db:"webhook_url"`  // webhook_out: URL to POST
+	WebhookBody            string     `db:"webhook_body"` // webhook_out: optional JSON body
+	EventToken             string     `db:"event_token"`  // webhook_in: per-run callback secret
+	ApprovalTimeoutSeconds int        `db:"approval_timeout_seconds"`
+	ApprovalTimeoutAction  string     `db:"approval_timeout_action"`
+	AwaitingSince          *time.Time `db:"awaiting_since"`
+	TimedOut               bool       `db:"timed_out"`
 }
 
 type wfEdge struct {
@@ -189,7 +193,9 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		        wjn.status, wjn.job_template_id, wjn.unified_job_id,
 		        COALESCE(wjn.webhook_url, '')  AS webhook_url,
 		        COALESCE(wjn.webhook_body, '') AS webhook_body,
-		        COALESCE(wjn.event_token, '') AS event_token
+		        COALESCE(wjn.event_token, '') AS event_token,
+		        wjn.approval_timeout_seconds, wjn.approval_timeout_action,
+		        wjn.awaiting_since, wjn.timed_out
 		 FROM workflow_job_nodes wjn
 		 WHERE wjn.workflow_job_id = $1`, wjID); err != nil {
 		return err
@@ -225,7 +231,31 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		}
 	}
 
-	// 1b. Fire approval-outcome notifications once. A user approves/denies an
+	// 1b. Expire approval gates whose snapshotted deadline has passed. The
+	// conditional UPDATE is the concurrency boundary against a human decision:
+	// whichever transition commits first wins, and the other sees zero rows.
+	for i := range nodes {
+		n := &nodes[i]
+		if n.NodeType != "approval" || n.Status != "awaiting_approval" || n.ApprovalTimeoutSeconds <= 0 {
+			continue
+		}
+		result, err := s.DB.ExecContext(ctx, `
+			UPDATE workflow_job_nodes
+			SET status=approval_timeout_action, timed_out=true
+			WHERE id=$1 AND status='awaiting_approval'
+			  AND awaiting_since + make_interval(secs => approval_timeout_seconds) <= now()`, n.ID)
+		if err != nil {
+			logger.Error("workflow approval timeout failed", "workflow_id", wjID, "node", n.NodeKey, "err", err)
+			continue
+		}
+		if changed, _ := result.RowsAffected(); changed == 1 {
+			n.Status = n.ApprovalTimeoutAction
+			n.TimedOut = true
+			logger.Info("workflow approval timed out", "workflow_id", wjID, "node", n.NodeKey, "outcome", n.Status)
+		}
+	}
+
+	// 1c. Fire approval-outcome notifications once. A user approves/denies an
 	// approval node via the API (status -> approved/rejected); the scheduler
 	// observes the outcome here and notifies, claiming outcome_notified so it fires
 	// exactly once.
@@ -240,7 +270,9 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 			continue
 		}
 		if rows, _ := res.RowsAffected(); rows == 1 {
-			if n.Status == "approved" {
+			if n.TimedOut {
+				s.notifyWorkflow(wjID, "timeout", "timed out")
+			} else if n.Status == "approved" {
 				s.notifyWorkflow(wjID, "approved", "approved")
 			} else {
 				s.notifyWorkflow(wjID, "denied", "denied")
