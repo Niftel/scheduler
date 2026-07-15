@@ -52,15 +52,15 @@ func (config claimServerConfig) validate() error {
 	return nil
 }
 
-func newClaimServer(database *sqlx.DB, config claimServerConfig) (*http.Server, error) {
+func newClaimServer(database *sqlx.DB, config claimServerConfig) (*http.Server, *secretsclient.Client, error) {
 	if err := config.validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !config.enabled() {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if database == nil {
-		return nil, errors.New("claim server database is required")
+		return nil, nil, errors.New("claim server database is required")
 	}
 	secrets, err := secretsclient.New(secretsclient.Config{
 		BaseURL:         config.SecretsURL,
@@ -70,27 +70,27 @@ func newClaimServer(database *sqlx.DB, config claimServerConfig) (*http.Server, 
 		Timeout:         10 * time.Second,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("configure secrets client: %w", err)
+		return nil, nil, fmt.Errorf("configure secrets client: %w", err)
 	}
 	serverCertificate, err := tls.LoadX509KeyPair(config.ServerCertificateFile, config.ServerPrivateKeyFile)
 	if err != nil {
-		return nil, fmt.Errorf("load claim server certificate: %w", err)
+		return nil, nil, fmt.Errorf("load claim server certificate: %w", err)
 	}
 	caPEM, err := os.ReadFile(config.ExecutorCAFile)
 	if err != nil {
-		return nil, fmt.Errorf("read claim client CA: %w", err)
+		return nil, nil, fmt.Errorf("read claim client CA: %w", err)
 	}
 	executorCAs := x509.NewCertPool()
 	if !executorCAs.AppendCertsFromPEM(caPEM) {
-		return nil, errors.New("claim client CA contains no certificates")
+		return nil, nil, errors.New("claim client CA contains no certificates")
 	}
 	tlsConfig, err := secretstransport.TLSConfig(serverCertificate, executorCAs)
 	if err != nil {
-		return nil, fmt.Errorf("configure claim server TLS: %w", err)
+		return nil, nil, fmt.Errorf("configure claim server TLS: %w", err)
 	}
 	handler, err := claim.NewHandler(claim.NewManager(database, secrets), config.TrustDomain)
 	if err != nil {
-		return nil, fmt.Errorf("configure claim handler: %w", err)
+		return nil, nil, fmt.Errorf("configure claim handler: %w", err)
 	}
 	address := config.Address
 	if address == "" {
@@ -105,5 +105,5 @@ func newClaimServer(database *sqlx.DB, config claimServerConfig) (*http.Server, 
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
-	}, nil
+	}, secrets, nil
 }
