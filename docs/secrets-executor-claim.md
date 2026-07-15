@@ -28,6 +28,27 @@ The scheduler exposes a dedicated mTLS listener, separate from metrics:
 
 `POST /internal/v1/execution-runs/{run_id}/claim`
 
+The listener is enabled only when `PRAETOR_SECRETS_URL` is set. Enabling it
+requires all of the following settings; scheduler startup fails if any are
+missing or invalid:
+
+| Setting | Purpose |
+| --- | --- |
+| `PRAETOR_SECRETS_URL` | HTTPS URL of the secrets service |
+| `PRAETOR_SECRETS_CA_FILE` | CA used to verify the secrets service |
+| `PRAETOR_SECRETS_CERT_FILE` | Scheduler client certificate for the secrets service |
+| `PRAETOR_SECRETS_KEY_FILE` | Scheduler client private-key file |
+| `PRAETOR_SECRETS_TRUST_DOMAIN` | Expected SPIFFE trust domain for workload identities |
+| `PRAETOR_CLAIM_ADDR` | Claim listener address; defaults to `:8443` |
+| `PRAETOR_CLAIM_CERT_FILE` | Claim listener server certificate |
+| `PRAETOR_CLAIM_KEY_FILE` | Claim listener server private-key file |
+| `PRAETOR_CLAIM_CLIENT_CA_FILE` | CA used to verify executor client certificates |
+
+The outbound scheduler identity and inbound listener identity deliberately use
+separate certificate settings. This permits independent issuance and rotation,
+and prevents trusting the secrets-service server CA as an executor issuer by
+accident. Private keys are accepted only as file paths.
+
 Request body:
 
 ```json

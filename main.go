@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -50,6 +52,20 @@ func main() {
 	// Base URL embedded in the manifest for the pushed host-runner to report back.
 	sched.APIURL = env.String("API_URL", "")
 	sched.SecretsIntegration = env.String("PRAETOR_SECRETS_URL", "") != ""
+	claimServer, err := newClaimServer(database, claimServerConfig{
+		SecretsURL:             env.String("PRAETOR_SECRETS_URL", ""),
+		SecretsCAFile:          env.String("PRAETOR_SECRETS_CA_FILE", ""),
+		SecretsCertificateFile: env.String("PRAETOR_SECRETS_CERT_FILE", ""),
+		SecretsPrivateKeyFile:  env.String("PRAETOR_SECRETS_KEY_FILE", ""),
+		TrustDomain:            env.String("PRAETOR_SECRETS_TRUST_DOMAIN", ""),
+		Address:                env.String("PRAETOR_CLAIM_ADDR", ":8443"),
+		ServerCertificateFile:  env.String("PRAETOR_CLAIM_CERT_FILE", ""),
+		ServerPrivateKeyFile:   env.String("PRAETOR_CLAIM_KEY_FILE", ""),
+		ExecutorCAFile:         env.String("PRAETOR_CLAIM_CLIENT_CA_FILE", ""),
+	})
+	if err != nil {
+		log.Fatalf("claim listener misconfigured: %v", err)
+	}
 
 	// Retention pruning (opt-OUT). JOB_RETENTION_DAYS defaults to 90: terminal jobs
 	// finished longer ago than that are deleted, along with their events and log
@@ -71,13 +87,37 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sched.Start(ctx)
+	claimErrors := make(chan error, 1)
+	if claimServer != nil {
+		go func() {
+			log.Printf("secure executor claim listener started on %s", claimServer.Addr)
+			if err := claimServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				claimErrors <- err
+			}
+		}()
+	}
 
 	// 4. Wait for SIGINT/SIGTERM
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	<-sigs
+	var claimFailure error
+	select {
+	case <-sigs:
+	case err := <-claimErrors:
+		claimFailure = err
+	}
 
 	// 5. Graceful shutdown
 	log.Println("Shutting down...")
 	cancel()
+	if claimServer != nil {
+		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := claimServer.Shutdown(shutdownContext); err != nil {
+			log.Printf("secure executor claim listener shutdown failed: %v", err)
+		}
+	}
+	if claimFailure != nil {
+		log.Fatalf("secure executor claim listener failed: %v", claimFailure)
+	}
 }
