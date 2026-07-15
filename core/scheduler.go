@@ -40,6 +40,10 @@ type Scheduler struct {
 	// pushed host-runner knows where to report back. Resolved in main from env;
 	// empty is valid (callers fall back to the in-cluster default).
 	APIURL string
+
+	// SecretsIntegration requires every credential-backed run to snapshot the
+	// external secrets-service UUID/version before its outbox launch can commit.
+	SecretsIntegration bool
 }
 
 func NewScheduler(db *sqlx.DB, interval time.Duration, publisher EventPublisher) *Scheduler {
@@ -130,11 +134,11 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 
 	for _, job := range jobs {
 		// 3. Create Execution Run
-		var runID uuid.UUID
-		err := tx.QueryRowContext(ctx, `
-			INSERT INTO execution_runs (unified_job_id, state)
-			VALUES ($1, 'pending')
-			RETURNING id`, job.ID).Scan(&runID)
+		runID := uuid.New()
+		dispatchID := uuid.New()
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO execution_runs (id, unified_job_id, state, dispatch_id)
+			VALUES ($1, $2, 'pending', $3)`, runID, job.ID, dispatchID)
 
 		if err != nil {
 			logger.Error("create run for job failed", "job_id", job.ID, "err", err)
@@ -191,9 +195,23 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 			}
 		}
 		if credID != 0 {
-			if _, err := tx.ExecContext(ctx,
+			if s.SecretsIntegration {
+				var serviceID *uuid.UUID
+				var serviceVersion *int64
+				if err := tx.QueryRowxContext(ctx, `SELECT secrets_service_id, secrets_service_version FROM credentials WHERE id = $1`, credID).Scan(&serviceID, &serviceVersion); err != nil {
+					return fmt.Errorf("read secrets-service reference for credential %d: %w", credID, err)
+				}
+				if serviceID == nil || serviceVersion == nil || *serviceVersion <= 0 {
+					return fmt.Errorf("credential %d is not managed by the secrets service", credID)
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE execution_runs
+					SET credential_id = $1, secrets_credential_id = $2, secrets_credential_version = $3 WHERE id = $4`,
+					credID, *serviceID, *serviceVersion, runID); err != nil {
+					return fmt.Errorf("snapshot secrets-service credential on run: %w", err)
+				}
+			} else if _, err := tx.ExecContext(ctx,
 				`UPDATE execution_runs SET credential_id = $1 WHERE id = $2`, credID, runID); err != nil {
-				logger.Error("snapshot credential id on run failed", "job_id", job.ID, "run_id", runID, "err", err)
+				return fmt.Errorf("snapshot credential id on run: %w", err)
 			}
 		}
 
@@ -203,6 +221,7 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 		req := &events.ExecutionRequest{
 			ManifestVersion: events.CurrentManifestVersion,
 			ExecutionRunID:  runID,
+			DispatchID:      dispatchID,
 			UnifiedJobID:    job.ID,
 			JobManifest:     manifest,
 			CreatedAt:       time.Now(),
