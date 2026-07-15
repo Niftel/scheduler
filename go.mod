@@ -10,7 +10,7 @@ require (
 	github.com/praetordev/db v0.1.0
 	github.com/praetordev/env v0.1.0
 	github.com/praetordev/eventbus v0.1.0
-	github.com/praetordev/events v0.1.0
+	github.com/praetordev/events v0.1.1-0.20260715180212-73a43baa18fc
 	github.com/praetordev/launch v0.1.1
 	github.com/praetordev/metrics v0.1.0
 	github.com/praetordev/models v0.2.0

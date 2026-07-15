@@ -49,6 +49,7 @@ func main() {
 	sched := core.NewScheduler(database, 5*time.Second, bus)
 	// Base URL embedded in the manifest for the pushed host-runner to report back.
 	sched.APIURL = env.String("API_URL", "")
+	sched.SecretsIntegration = env.String("PRAETOR_SECRETS_URL", "") != ""
 
 	// Retention pruning (opt-OUT). JOB_RETENTION_DAYS defaults to 90: terminal jobs
 	// finished longer ago than that are deleted, along with their events and log
