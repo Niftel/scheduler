@@ -6,17 +6,20 @@ import (
 )
 
 func TestClaimServerDisabledWithoutSecretsURL(t *testing.T) {
-	server, err := newClaimServer(nil, claimServerConfig{})
+	server, secrets, err := newClaimServer(nil, claimServerConfig{})
 	if err != nil {
 		t.Fatalf("newClaimServer: %v", err)
 	}
 	if server != nil {
 		t.Fatal("disabled claim server must be nil")
 	}
+	if secrets != nil {
+		t.Fatal("disabled secrets client must be nil")
+	}
 }
 
 func TestClaimServerRejectsPartialConfiguration(t *testing.T) {
-	_, err := newClaimServer(nil, claimServerConfig{SecretsURL: "https://secrets.internal"})
+	_, _, err := newClaimServer(nil, claimServerConfig{SecretsURL: "https://secrets.internal"})
 	if err == nil {
 		t.Fatal("expected partial configuration to fail")
 	}

@@ -52,7 +52,7 @@ func main() {
 	// Base URL embedded in the manifest for the pushed host-runner to report back.
 	sched.APIURL = env.String("API_URL", "")
 	sched.SecretsIntegration = env.String("PRAETOR_SECRETS_URL", "") != ""
-	claimServer, err := newClaimServer(database, claimServerConfig{
+	claimServer, secretsClient, err := newClaimServer(database, claimServerConfig{
 		SecretsURL:             env.String("PRAETOR_SECRETS_URL", ""),
 		SecretsCAFile:          env.String("PRAETOR_SECRETS_CA_FILE", ""),
 		SecretsCertificateFile: env.String("PRAETOR_SECRETS_CERT_FILE", ""),
@@ -87,6 +87,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sched.Start(ctx)
+	if secretsClient != nil {
+		go core.NewBindingCanceller(database, secretsClient).Start(ctx, 5*time.Second)
+	}
 	claimErrors := make(chan error, 1)
 	if claimServer != nil {
 		go func() {

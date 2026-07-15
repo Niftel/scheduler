@@ -88,6 +88,12 @@ request and receives the same binding.
   the claim succeeds.
 - Terminal run processing cancels the binding using the stored dispatch ID.
 
+Cancellation is reconciled by the scheduler after the consumer durably records
+`successful`, `failed`, or `canceled`. A successful secrets-service response is
+recorded in `credential_binding_canceled_at` with an immutable reason. If the
+service is unavailable, that marker remains empty and the scheduler retries;
+the secrets-service operation is idempotent for the same run and dispatch ID.
+
 ## Required schema
 
 `execution_runs` gains:
