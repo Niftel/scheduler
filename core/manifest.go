@@ -68,13 +68,17 @@ func (s *Scheduler) buildJobManifest(ctx context.Context, tx *sqlx.Tx, job model
 
 	// Project (SCM URL for the playbook), if the template has one.
 	var projectURL string
+	var projectRef string
 	if template.ProjectID != nil {
 		var project models.Project
 		if err := tx.GetContext(ctx, &project,
-			`SELECT id, name, scm_url FROM projects WHERE id = $1`, *template.ProjectID); err != nil {
+			`SELECT id, name, scm_url, scm_branch FROM projects WHERE id = $1`, *template.ProjectID); err != nil {
 			return events.JobManifest{}, 0, 0, fmt.Errorf("find project %d for template %q: %w", *template.ProjectID, template.Name, err)
 		}
 		projectURL = project.SCMURL
+		if project.SCMBranch != nil {
+			projectRef = *project.SCMBranch
+		}
 		logger.Info("using project for job", "project", project.Name, "scm_url", project.SCMURL, "job_id", job.ID)
 	} else {
 		logger.Info("template has no project - using default/inline logic", "template", template.Name, "job_id", job.ID)
@@ -125,6 +129,7 @@ func (s *Scheduler) buildJobManifest(ctx context.Context, tx *sqlx.Tx, job model
 	m := events.JobManifest{
 		InventoryID:     inventoryID, // executor fetches + fills Inventory + CachedFacts at dispatch (#13/#48)
 		ProjectURL:      projectURL,
+		ProjectRef:      projectRef,
 		Playbook:        template.Playbook,
 		PlaybookContent: "", // inline playbooks disabled — SCM projects only
 		ExtraVars:       jobOpts.MergeExtraVars(template.ExtraVars),
