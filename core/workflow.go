@@ -89,7 +89,7 @@ type wfEdge struct {
 
 func wfTerminal(st string) bool {
 	switch st {
-	case "successful", "failed", "skipped", "approved", "rejected":
+	case "successful", "failed", "canceled", "skipped", "approved", "rejected":
 		return true
 	}
 	return false
@@ -102,9 +102,9 @@ func wfEdgeFires(edgeType, parentState string) bool {
 	case "success":
 		return parentState == "successful" || parentState == "approved"
 	case "failure":
-		return parentState == "failed" || parentState == "rejected"
+		return parentState == "failed" || parentState == "canceled" || parentState == "rejected"
 	case "always":
-		return parentState == "successful" || parentState == "failed" || parentState == "approved" || parentState == "rejected"
+		return parentState == "successful" || parentState == "failed" || parentState == "canceled" || parentState == "approved" || parentState == "rejected"
 	}
 	return false
 }
@@ -219,10 +219,12 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		if n.Status == "running" && n.UnifiedJobID != nil {
 			var st string
 			if err := s.DB.GetContext(ctx, &st, `SELECT status FROM unified_jobs WHERE id=$1`, *n.UnifiedJobID); err == nil {
-				if st == "successful" || st == "failed" || st == "error" {
+				if st == "successful" || st == "failed" || st == "canceled" || st == "error" {
 					newSt := "failed"
 					if st == "successful" {
 						newSt = "successful"
+					} else if st == "canceled" {
+						newSt = "canceled"
 					}
 					logExec(ctx, s.DB, `UPDATE workflow_job_nodes SET status=$1 WHERE id=$2`, newSt, n.ID)
 					n.Status = newSt
@@ -367,13 +369,19 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 	}
 	if allTerminal {
 		anyFail := false
+		anyCanceled := false
 		for i := range nodes {
 			if nodes[i].Status == "failed" || nodes[i].Status == "rejected" {
 				anyFail = true
 			}
+			if nodes[i].Status == "canceled" {
+				anyCanceled = true
+			}
 		}
 		status := "successful"
-		if anyFail {
+		if anyCanceled {
+			status = "canceled"
+		} else if anyFail {
 			status = "failed"
 		}
 		logExec(ctx, s.DB, `UPDATE workflow_jobs SET status=$1, finished_at=now() WHERE id=$2`, status, wjID)
@@ -383,6 +391,8 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		// there is no dedup to do.
 		if status == "successful" {
 			s.notifyWorkflow(wjID, "success", "succeeded")
+		} else if status == "canceled" {
+			s.notifyWorkflow(wjID, "error", "was canceled")
 		} else {
 			s.notifyWorkflow(wjID, "error", "failed")
 		}
