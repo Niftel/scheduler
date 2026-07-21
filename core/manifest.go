@@ -23,7 +23,7 @@ import (
 // its manifest. Returns the manifest and the credential id to snapshot on the
 // run (0 = none). The executor runs `ansible-inventory --list` for the source and
 // upserts the result into the referenced inventory.
-func (s *Scheduler) buildSyncManifest(ctx context.Context, tx *sqlx.Tx, sourceID int64) (events.JobManifest, int64, error) {
+func (s *Scheduler) buildSyncManifest(ctx context.Context, tx *sqlx.Tx, sourceID int64, preview bool) (events.JobManifest, int64, error) {
 	var src struct {
 		InventoryID  int64  `db:"inventory_id"`
 		Source       string `db:"source"`
@@ -36,6 +36,7 @@ func (s *Scheduler) buildSyncManifest(ctx context.Context, tx *sqlx.Tx, sourceID
 	}
 	m := events.JobManifest{
 		InventorySync:       true,
+		InventoryPreview:    preview,
 		InventorySource:     src.Source,
 		InventorySourceKind: src.Kind,
 		SyncInventoryID:     src.InventoryID,
