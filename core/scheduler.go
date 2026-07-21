@@ -161,8 +161,9 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 		// builder in manifest.go; both return the ids we snapshot on the run below.
 		var manifest events.JobManifest
 		var runnerHostID, credID int64
-		if srcID := launch.ParseArgs(job.JobArgs).InventorySourceID; srcID > 0 {
-			m, cred, berr := s.buildSyncManifest(ctx, tx, srcID)
+		jobOpts := launch.ParseArgs(job.JobArgs)
+		if srcID := jobOpts.InventorySourceID; srcID > 0 {
+			m, cred, berr := s.buildSyncManifest(ctx, tx, srcID, jobOpts.InventoryPreview)
 			if berr != nil {
 				logger.Error("build inventory-sync manifest failed", "job_id", job.ID, "source_id", srcID, "err", berr)
 				logExec(ctx, tx, "UPDATE unified_jobs SET status='failed' WHERE id=$1", job.ID)
