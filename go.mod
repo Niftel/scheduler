@@ -3,6 +3,7 @@ module github.com/praetordev/scheduler
 go 1.26.5
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/Niftel/praetor-secrets v0.0.0-20260715173907-72d64f40b742
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.4.0
@@ -14,17 +15,16 @@ require (
 	github.com/praetordev/events v0.1.2-0.20260721152035-6660ddd52b3a
 	github.com/praetordev/launch v0.1.2-0.20260721152036-bccc41205bc4
 	github.com/praetordev/metrics v0.1.0
-	github.com/praetordev/models v0.2.0
+	github.com/praetordev/models v0.2.1
 	github.com/praetordev/notify v0.1.0
 	github.com/praetordev/objectstore v0.1.1
 	github.com/praetordev/plog v0.1.0
-	github.com/praetordev/store v0.1.2
+	github.com/praetordev/store v0.1.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/teambition/rrule-go v1.8.2
 )
 
 require (
-	github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

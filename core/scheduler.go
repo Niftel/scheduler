@@ -339,6 +339,31 @@ func (s *Scheduler) processSchedules(ctx context.Context) error {
 
 	for _, sched := range schedules {
 		logger.Info("processing schedule", "schedule_id", sched.ID, "name", sched.Name, "due_at", sched.NextRun)
+		skipLaunch := false
+		if sched.InventorySourceID != nil {
+			if sched.ActorUserID == nil {
+				logger.Warn("inventory-source schedule has no actor; disabling", "schedule_id", sched.ID)
+				logExec(ctx, tx, "UPDATE schedules SET enabled=false, modified_at=NOW() WHERE id=$1", sched.ID)
+				continue
+			}
+			allowed, authErr := scheduleActorCanSyncSource(ctx, tx, *sched.ActorUserID, *sched.InventorySourceID)
+			if authErr != nil {
+				return fmt.Errorf("re-authorize inventory-source schedule %d: %w", sched.ID, authErr)
+			}
+			if !allowed {
+				logger.Warn("inventory-source schedule actor no longer authorized; disabling", "schedule_id", sched.ID, "actor_user_id", *sched.ActorUserID)
+				logExec(ctx, tx, "UPDATE schedules SET enabled=false, modified_at=NOW() WHERE id=$1", sched.ID)
+				continue
+			}
+			if err := tx.GetContext(ctx, &skipLaunch, `SELECT EXISTS(
+				SELECT 1 FROM inventory_sync_history
+				WHERE inventory_source_id=$1 AND status IN ('pending','running'))`, *sched.InventorySourceID); err != nil {
+				return fmt.Errorf("check inventory-source overlap for schedule %d: %w", sched.ID, err)
+			}
+			if skipLaunch {
+				logger.Info("inventory-source schedule occurrence skipped; synchronization already active", "schedule_id", sched.ID, "inventory_source_id", *sched.InventorySourceID)
+			}
+		}
 
 		// 2. Launch the schedule's target — a workflow run or a job template —
 		// carrying the schedule's own extra_vars into the job. (Previously these
@@ -352,11 +377,24 @@ func (s *Scheduler) processSchedules(ctx context.Context) error {
 				opts.ExtraVars = ev
 			}
 		}
-		if err := launchTarget(ctx, tx, sched.Name, sched.WorkflowTemplateID, sched.UnifiedJobTemplateID, opts); err != nil {
-			logger.Error("launch target for schedule failed", "schedule_id", sched.ID, "err", err)
+		if sched.InventorySourceID != nil && !skipLaunch {
+			opts.InventorySourceID = *sched.InventorySourceID
+		}
+		var launchErr error
+		if skipLaunch {
+			launchErr = nil
+		} else if sched.InventorySourceID != nil {
+			_, launchErr = launch.Job(ctx, tx, sched.Name, nil, opts)
+		} else {
+			launchErr = launchTarget(ctx, tx, sched.Name, sched.WorkflowTemplateID, sched.UnifiedJobTemplateID, opts)
+		}
+		if launchErr != nil {
+			logger.Error("launch target for schedule failed", "schedule_id", sched.ID, "err", launchErr)
 			continue
 		}
-		logger.Info("launched target for schedule", "schedule_id", sched.ID)
+		if !skipLaunch {
+			logger.Info("launched target for schedule", "schedule_id", sched.ID)
+		}
 
 		// 3. (Skipped) We do NOT create execution_run here.
 		// The existing processPendingJobs loop picks up 'pending' jobs with no current_run_id and handles it.
@@ -388,6 +426,38 @@ func (s *Scheduler) processSchedules(ctx context.Context) error {
 	}
 
 	return tx.Commit()
+}
+
+// scheduleActorCanSyncSource fails closed and rechecks the creator's current
+// update_inventory capability immediately before every scheduled launch.
+func scheduleActorCanSyncSource(ctx context.Context, tx *sqlx.Tx, userID, sourceID int64) (bool, error) {
+	var allowed bool
+	err := tx.GetContext(ctx, &allowed, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM inventory_sources src
+			JOIN inventories inv ON inv.id = src.inventory_id
+			JOIN users u ON u.id = $1
+			WHERE src.id = $2 AND (
+				u.is_superuser
+				OR EXISTS (
+					SELECT 1 FROM object_roles orl
+					JOIN role_definition_permissions rdp ON rdp.role_definition_id = orl.role_definition_id
+					JOIN dab_permissions p ON p.id = rdp.permission_id
+					WHERE orl.content_type IS NULL AND p.codename = 'update_inventory'
+					AND (EXISTS (SELECT 1 FROM role_user_assignments ua WHERE ua.object_role_id=orl.id AND ua.user_id=$1)
+					 OR EXISTS (SELECT 1 FROM role_team_assignments ta JOIN team_members tm ON tm.team_id=ta.team_id WHERE ta.object_role_id=orl.id AND tm.user_id=$1))
+				)
+				OR EXISTS (
+					SELECT 1 FROM role_evaluations e
+					JOIN object_roles orl ON orl.id=e.object_role_id
+					WHERE e.content_type='inventory' AND e.object_id=inv.id AND e.codename='update_inventory'
+					AND (EXISTS (SELECT 1 FROM role_user_assignments ua WHERE ua.object_role_id=orl.id AND ua.user_id=$1)
+					 OR EXISTS (SELECT 1 FROM role_team_assignments ta JOIN team_members tm ON tm.team_id=ta.team_id WHERE ta.object_role_id=orl.id AND tm.user_id=$1))
+				)
+			)
+		)`, userID, sourceID)
+	return allowed, err
 }
 
 // processTimedOutJobs marks jobs that are stuck in running/queued state as failed.
