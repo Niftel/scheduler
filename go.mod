@@ -14,13 +14,13 @@ require (
 	github.com/praetordev/eventbus v0.1.0
 	github.com/praetordev/events v0.1.2-0.20260721152035-6660ddd52b3a
 	github.com/praetordev/launch v0.1.2-0.20260721152036-bccc41205bc4
-	github.com/praetordev/metrics v0.1.0
+	github.com/praetordev/metrics v0.1.1
 	github.com/praetordev/models v0.2.1
 	github.com/praetordev/notify v0.1.0
-	github.com/praetordev/objectstore v0.1.1
+	github.com/praetordev/objectstore v0.1.2
 	github.com/praetordev/plog v0.1.0
 	github.com/praetordev/store v0.1.4
-	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_golang v1.24.0
 	github.com/teambition/rrule-go v1.8.2
 )
 
@@ -31,19 +31,18 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/pgx/v5 v5.10.0 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/klauspost/compress v1.18.5 // indirect
+	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nats-io/nats.go v1.52.0 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/praetordev/registry v0.1.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.66.1 // indirect
-	github.com/prometheus/procfs v0.16.1 // indirect
-	go.yaml.in/yaml/v2 v2.4.2 // indirect
+	github.com/prometheus/common v0.70.0 // indirect
+	github.com/prometheus/procfs v0.21.1 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
-	google.golang.org/protobuf v1.36.8 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )
