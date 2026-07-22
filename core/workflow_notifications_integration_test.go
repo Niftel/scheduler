@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -49,9 +50,14 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
+	receiverURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", receiverURL.Hostname())
 
-	// --- Fixture: org, a webhook notification template pointing at srv, a workflow
-	// template with a single approval node, and an attachment for every event. ---
+	// --- Fixture: org, two teams, a webhook notification template pointing at srv,
+	// a workflow template with one approval node, and a policy for every event. ---
 	var orgID int64
 	if err := db.QueryRow(`INSERT INTO organizations (name) VALUES ($1) RETURNING id`,
 		fmt.Sprintf("wf-notif-org-%d", uniq)).Scan(&orgID); err != nil {
@@ -76,16 +82,34 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 		t.Fatalf("insert workflow_template: %v", err)
 	}
 	if _, err := db.Exec(
-		`INSERT INTO workflow_nodes (workflow_template_id, node_key, node_type, name)
-		 VALUES ($1,'gate','approval','the gate')`, wtID); err != nil {
+		`INSERT INTO workflow_nodes
+		 (workflow_template_id, node_key, node_type, name, approval_timeout_seconds, approval_timeout_action)
+		 VALUES ($1,'gate','approval','the gate',86400,'rejected')`, wtID); err != nil {
 		t.Fatalf("insert approval node: %v", err)
 	}
+	var assignedTeamID, otherTeamID int64
+	if err := db.QueryRow(`INSERT INTO teams (organization_id,name) VALUES ($1,$2) RETURNING id`, orgID, fmt.Sprintf("wf-notif-team-%d", uniq)).Scan(&assignedTeamID); err != nil {
+		t.Fatalf("insert assigned team: %v", err)
+	}
+	if err := db.QueryRow(`INSERT INTO teams (organization_id,name) VALUES ($1,$2) RETURNING id`, orgID, fmt.Sprintf("wf-notif-other-team-%d", uniq)).Scan(&otherTeamID); err != nil {
+		t.Fatalf("insert other team: %v", err)
+	}
 	for _, ev := range []string{"started", "success", "error", "approval", "approved", "denied", "timeout"} {
-		if _, err := db.Exec(
-			`INSERT INTO workflow_template_notifications (workflow_template_id, notification_template_id, event)
-			 VALUES ($1,$2,$3)`, wtID, ntID, ev); err != nil {
+		var teamID interface{}
+		if ev == "approval" || ev == "approved" || ev == "denied" || ev == "timeout" {
+			teamID = assignedTeamID
+		}
+		if _, err := db.Exec(`INSERT INTO notification_policies
+			(organization_id,team_id,notification_template_id,resource_type,resource_id,event)
+			VALUES ($1,$2,$3,'workflow_template',$4,$5)`, orgID, teamID, ntID, wtID, ev); err != nil {
 			t.Fatalf("attach %s notification: %v", ev, err)
 		}
+	}
+	// A policy for another team must never receive the assigned team's approval.
+	if _, err := db.Exec(`INSERT INTO notification_policies
+		(organization_id,team_id,notification_template_id,resource_type,resource_id,event)
+		VALUES ($1,$2,$3,'workflow_template',$4,'approval')`, orgID, otherTeamID, ntID, wtID); err != nil {
+		t.Fatalf("attach other-team approval notification: %v", err)
 	}
 
 	// seen records every delivery (event -> kind). expect drains until the wanted
@@ -123,6 +147,9 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch.Workflow A: %v", err)
 	}
+	if _, err := db.Exec(`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`, assignedTeamID, wjA); err != nil {
+		t.Fatalf("assign workflow A approval team: %v", err)
+	}
 	advance(t, wjA, "A start")
 	expect(t, "started", "workflow")
 	expect(t, "approval", "workflow approval")
@@ -151,6 +178,9 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch.Workflow B: %v", err)
 	}
+	if _, err := db.Exec(`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`, assignedTeamID, wjB); err != nil {
+		t.Fatalf("assign workflow B approval team: %v", err)
+	}
 	advance(t, wjB, "B start")
 	expect(t, "started", "workflow")
 	expect(t, "approval", "workflow approval")
@@ -163,27 +193,27 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 	expect(t, "error", "workflow")
 	assertWFStatus(t, db, wjB, "failed")
 
-	// --- Timeout path: the run snapshot carries the template policy. Moving the
-	// durable waiting timestamp into the past lets the next scheduler tick expire
-	// it through the configured success path, with no human decision actor. ---
-	if _, err := db.Exec(`UPDATE workflow_nodes SET approval_timeout_seconds=1, approval_timeout_action='approved' WHERE workflow_template_id=$1 AND node_key='gate'`, wtID); err != nil {
-		t.Fatalf("configure approval timeout: %v", err)
-	}
+	// --- Timeout path: the platform's fixed 24-hour reject policy is copied into
+	// the run snapshot. Moving the durable waiting timestamp beyond that deadline
+	// lets the next scheduler tick reject it with no human decision actor. ---
 	seen = map[string]string{}
 	wjC, err := launch.Workflow(ctx, db, wtID, launch.Options{})
 	if err != nil {
 		t.Fatalf("launch.Workflow C: %v", err)
 	}
+	if _, err := db.Exec(`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`, assignedTeamID, wjC); err != nil {
+		t.Fatalf("assign workflow C approval team: %v", err)
+	}
 	advance(t, wjC, "C start")
 	expect(t, "started", "workflow")
 	expect(t, "approval", "workflow approval")
-	if _, err := db.Exec(`UPDATE workflow_job_nodes SET awaiting_since=now()-interval '2 seconds' WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
+	if _, err := db.Exec(`UPDATE workflow_job_nodes SET awaiting_since=now()-interval '25 hours' WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
 		t.Fatalf("age approval gate: %v", err)
 	}
 	advance(t, wjC, "C timeout")
 	expect(t, "timeout", "workflow approval")
-	expect(t, "success", "workflow")
-	assertWFStatus(t, db, wjC, "successful")
+	expect(t, "error", "workflow")
+	assertWFStatus(t, db, wjC, "failed")
 	var audit struct {
 		Status    string     `db:"status"`
 		TimedOut  bool       `db:"timed_out"`
@@ -193,7 +223,7 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 	if err := db.Get(&audit, `SELECT status,timed_out,decided_at,decided_by_user_id FROM workflow_job_nodes WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
 		t.Fatalf("read timeout audit: %v", err)
 	}
-	if audit.Status != "approved" || !audit.TimedOut || audit.DecidedAt == nil || audit.DecidedBy != nil {
+	if audit.Status != "rejected" || !audit.TimedOut || audit.DecidedAt == nil || audit.DecidedBy != nil {
 		t.Fatalf("unexpected timeout audit: %+v", audit)
 	}
 }
