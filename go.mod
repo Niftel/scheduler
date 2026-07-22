@@ -16,7 +16,7 @@ require (
 	github.com/praetordev/launch v0.1.2-0.20260721152036-bccc41205bc4
 	github.com/praetordev/metrics v0.1.0
 	github.com/praetordev/models v0.2.1
-	github.com/praetordev/notify v0.1.0
+	github.com/praetordev/notify v0.1.1-0.20260722200731-355964eafa44
 	github.com/praetordev/objectstore v0.1.1
 	github.com/praetordev/plog v0.1.0
 	github.com/praetordev/store v0.1.4
