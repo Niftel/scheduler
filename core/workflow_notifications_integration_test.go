@@ -2,13 +2,9 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,15 +13,201 @@ import (
 	"github.com/praetordev/launch"
 )
 
-// TestWorkflowNotificationsFire proves the scheduler dispatches every workflow
-// notification event exactly where its transition happens: 'started' on first
-// advance, 'approval' when an approval node starts waiting, 'approved'/'denied' on
-// a human outcome, 'timeout' on expiry, and 'success'/'error' on terminal finalize. It stands up a
-// real HTTP receiver (the webhook backend) and asserts each delivery carries the
-// right event + workflow kind.
-//
-// Requires TEST_DATABASE_URL (migrated); skips otherwise.
-func TestWorkflowNotificationsFire(t *testing.T) {
+// TestWorkflowNotificationsEnqueueDurably exercises the real PostgreSQL
+// transition path. The target deliberately points at an unavailable endpoint:
+// scheduling must depend only on durable database state, never destination
+// availability or decrypted target configuration.
+func TestWorkflowNotificationsEnqueueDurably(t *testing.T) {
+	db := workflowNotificationTestDB(t)
+	ctx := context.Background()
+	uniq := time.Now().UnixNano()
+
+	var orgID int64
+	if err := db.QueryRow(
+		`INSERT INTO organizations (name) VALUES ($1) RETURNING id`,
+		fmt.Sprintf("wf-delivery-org-%d", uniq),
+	).Scan(&orgID); err != nil {
+		t.Fatalf("insert organization: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM organizations WHERE id=$1`, orgID) })
+
+	assignedTeamID := insertNotificationTeam(t, db, orgID, fmt.Sprintf("assigned-%d", uniq))
+	otherTeamID := insertNotificationTeam(t, db, orgID, fmt.Sprintf("other-%d", uniq))
+	targetID := insertNotificationTarget(
+		t, db, orgID, fmt.Sprintf("offline-target-%d", uniq), "webhook",
+		`{"url":"http://127.0.0.1:1","credential":"must-not-be-read-by-scheduler"}`,
+	)
+	templateID := insertApprovalWorkflowTemplate(t, db, orgID, fmt.Sprintf("durable-workflow-%d", uniq), "gate-a", "gate-b")
+
+	for _, event := range []string{"started", "success", "error"} {
+		insertNotificationPolicy(t, db, orgID, nil, targetID, templateID, event)
+	}
+	for _, event := range []string{"approval", "approved", "denied", "timeout"} {
+		insertNotificationPolicy(t, db, orgID, &assignedTeamID, targetID, templateID, event)
+		insertNotificationPolicy(t, db, orgID, &otherTeamID, targetID, templateID, event)
+	}
+
+	scheduler := NewScheduler(db, time.Second, nil)
+
+	t.Run("assigned team, distinct nodes, deduplication, and restart", func(t *testing.T) {
+		runID := launchNotificationWorkflow(t, ctx, db, templateID, assignedTeamID)
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "start")
+
+		assertDeliveryCount(t, db, runID, "started", nil, 1)
+		assertDeliveryCount(t, db, runID, "approval", &assignedTeamID, 2)
+		assertDeliveryCount(t, db, runID, "approval", &otherTeamID, 0)
+		assertDistinctOccurrences(t, db, runID, "approval", 2)
+
+		// Reprocessing and a process restart must both leave the logical
+		// occurrences unchanged.
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "duplicate advancement")
+		restarted := NewScheduler(db, time.Second, nil)
+		advanceNotificationWorkflow(t, restarted, ctx, runID, "restart advancement")
+		assertDeliveryCount(t, db, runID, "started", nil, 1)
+		assertDeliveryCount(t, db, runID, "approval", &assignedTeamID, 2)
+
+		if _, err := db.Exec(`
+			UPDATE workflow_job_nodes
+			SET status='approved'
+			WHERE workflow_job_id=$1 AND node_key IN ('gate-a','gate-b')`, runID); err != nil {
+			t.Fatalf("approve workflow nodes: %v", err)
+		}
+		advanceNotificationWorkflow(t, restarted, ctx, runID, "approval completion")
+		assertDeliveryCount(t, db, runID, "approved", &assignedTeamID, 2)
+		assertDeliveryCount(t, db, runID, "approved", &otherTeamID, 0)
+		assertDeliveryCount(t, db, runID, "success", nil, 1)
+		assertWorkflowStatus(t, db, runID, "successful")
+	})
+
+	t.Run("denied outcome", func(t *testing.T) {
+		runID := launchNotificationWorkflow(t, ctx, db, templateID, assignedTeamID)
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "start")
+		if _, err := db.Exec(`
+			UPDATE workflow_job_nodes
+			SET status=CASE node_key WHEN 'gate-a' THEN 'rejected' ELSE 'approved' END
+			WHERE workflow_job_id=$1`, runID); err != nil {
+			t.Fatalf("decide workflow nodes: %v", err)
+		}
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "denied completion")
+		assertDeliveryCount(t, db, runID, "denied", &assignedTeamID, 1)
+		assertDeliveryCount(t, db, runID, "approved", &assignedTeamID, 1)
+		assertDeliveryCount(t, db, runID, "error", nil, 1)
+		assertWorkflowStatus(t, db, runID, "failed")
+	})
+
+	t.Run("timeout outcome", func(t *testing.T) {
+		runID := launchNotificationWorkflow(t, ctx, db, templateID, assignedTeamID)
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "start")
+		if _, err := db.Exec(`
+			UPDATE workflow_job_nodes
+			SET awaiting_since=CASE
+				WHEN node_key='gate-a' THEN now()-interval '25 hours'
+				ELSE awaiting_since
+			END,
+			status=CASE WHEN node_key='gate-b' THEN 'approved' ELSE status END
+			WHERE workflow_job_id=$1`, runID); err != nil {
+			t.Fatalf("prepare timeout workflow: %v", err)
+		}
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "timeout completion")
+		assertDeliveryCount(t, db, runID, "timeout", &assignedTeamID, 1)
+		assertDeliveryCount(t, db, runID, "approved", &assignedTeamID, 1)
+		assertDeliveryCount(t, db, runID, "error", nil, 1)
+		assertWorkflowStatus(t, db, runID, "failed")
+
+		var audit struct {
+			Status          string `db:"status"`
+			TimedOut        bool   `db:"timed_out"`
+			OutcomeNotified bool   `db:"outcome_notified"`
+		}
+		if err := db.Get(&audit, `
+			SELECT status, timed_out, outcome_notified
+			FROM workflow_job_nodes
+			WHERE workflow_job_id=$1 AND node_key='gate-a'`, runID); err != nil {
+			t.Fatalf("read timeout audit: %v", err)
+		}
+		if audit.Status != "rejected" || !audit.TimedOut || !audit.OutcomeNotified {
+			t.Fatalf("unexpected timeout audit: %+v", audit)
+		}
+	})
+
+	t.Run("preexisting timeout is recovered after restart", func(t *testing.T) {
+		runID := launchNotificationWorkflow(t, ctx, db, templateID, assignedTeamID)
+		advanceNotificationWorkflow(t, scheduler, ctx, runID, "start")
+		if _, err := db.Exec(`
+			UPDATE workflow_job_nodes
+			SET status=CASE node_key WHEN 'gate-a' THEN 'rejected' ELSE 'approved' END,
+			    timed_out=(node_key='gate-a'),
+			    outcome_notified=false
+			WHERE workflow_job_id=$1`, runID); err != nil {
+			t.Fatalf("prepare preexisting timeout: %v", err)
+		}
+
+		restarted := NewScheduler(db, time.Second, nil)
+		advanceNotificationWorkflow(t, restarted, ctx, runID, "recover preexisting timeout")
+		assertDeliveryCount(t, db, runID, "timeout", &assignedTeamID, 1)
+		assertDeliveryCount(t, db, runID, "approved", &assignedTeamID, 1)
+		assertDeliveryCount(t, db, runID, "error", nil, 1)
+		assertWorkflowStatus(t, db, runID, "failed")
+	})
+}
+
+// TestWorkflowNotificationEnqueueFailureRollsBackTransition proves an enqueue
+// failure cannot strand a state watermark ahead of its delivery. A deliberately
+// overlong target type is legal in the legacy target table but rejected by the
+// bounded delivery snapshot, forcing the INSERT and the surrounding transition
+// transaction to roll back.
+func TestWorkflowNotificationEnqueueFailureRollsBackTransition(t *testing.T) {
+	db := workflowNotificationTestDB(t)
+	ctx := context.Background()
+	uniq := time.Now().UnixNano()
+
+	var orgID int64
+	if err := db.QueryRow(
+		`INSERT INTO organizations (name) VALUES ($1) RETURNING id`,
+		fmt.Sprintf("wf-rollback-org-%d", uniq),
+	).Scan(&orgID); err != nil {
+		t.Fatalf("insert organization: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM organizations WHERE id=$1`, orgID) })
+
+	teamID := insertNotificationTeam(t, db, orgID, fmt.Sprintf("rollback-team-%d", uniq))
+	targetID := insertNotificationTarget(
+		t, db, orgID, fmt.Sprintf("rollback-target-%d", uniq),
+		strings.Repeat("x", 65), `{}`,
+	)
+	templateID := insertApprovalWorkflowTemplate(
+		t, db, orgID, fmt.Sprintf("rollback-workflow-%d", uniq), "gate",
+	)
+	insertNotificationPolicy(t, db, orgID, &teamID, targetID, templateID, "approval")
+
+	runID := launchNotificationWorkflow(t, ctx, db, templateID, teamID)
+	scheduler := NewScheduler(db, time.Second, nil)
+	if err := scheduler.advanceWorkflow(ctx, runID); err == nil {
+		t.Fatal("advanceWorkflow succeeded; want bounded delivery snapshot failure")
+	}
+
+	var state struct {
+		Status          string `db:"status"`
+		StartedNotified bool   `db:"started_notified"`
+	}
+	if err := db.Get(&state, `
+		SELECT wjn.status, wj.started_notified
+		FROM workflow_jobs wj
+		JOIN workflow_job_nodes wjn ON wjn.workflow_job_id=wj.id
+		WHERE wj.id=$1`, runID); err != nil {
+		t.Fatalf("read rolled-back state: %v", err)
+	}
+	if state.Status != "pending" {
+		t.Fatalf("approval node status=%q, want pending after enqueue rollback", state.Status)
+	}
+	if !state.StartedNotified {
+		t.Fatal("independent started watermark was unexpectedly rolled back")
+	}
+	assertDeliveryCount(t, db, runID, "approval", &teamID, 0)
+}
+
+func workflowNotificationTestDB(t *testing.T) *sqlx.DB {
+	t.Helper()
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping workflow notification integration test")
@@ -34,207 +216,174 @@ func TestWorkflowNotificationsFire(t *testing.T) {
 	if err != nil {
 		t.Skipf("cannot reach TEST_DATABASE_URL: %v", err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
 
-	ctx := context.Background()
-	sched := NewScheduler(db, time.Second, nil)
-	uniq := time.Now().UnixNano()
-
-	// HTTP receiver for the webhook backend; each delivery is pushed to got.
-	got := make(chan map[string]interface{}, 16)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		var m map[string]interface{}
-		_ = json.Unmarshal(b, &m)
-		got <- m
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-	receiverURL, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", receiverURL.Hostname())
-
-	// --- Fixture: org, two teams, a webhook notification template pointing at srv,
-	// a workflow template with one approval node, and a policy for every event. ---
-	var orgID int64
-	if err := db.QueryRow(`INSERT INTO organizations (name) VALUES ($1) RETURNING id`,
-		fmt.Sprintf("wf-notif-org-%d", uniq)).Scan(&orgID); err != nil {
-		t.Fatalf("insert org: %v", err)
-	}
-	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM organizations WHERE id=$1`, orgID) })
-
-	// Config is stored as plaintext {"url":...}; DecryptConfig passes through values
-	// that aren't ciphertext, so no crypto setup is needed in the test.
-	cfg, _ := json.Marshal(map[string]string{"url": srv.URL})
-	var ntID int64
+func insertNotificationTeam(t *testing.T, db *sqlx.DB, orgID int64, name string) int64 {
+	t.Helper()
+	var id int64
 	if err := db.QueryRow(
-		`INSERT INTO notification_templates (organization_id, name, notification_type, config)
-		 VALUES ($1,$2,'webhook',$3) RETURNING id`,
-		orgID, fmt.Sprintf("wf-notif-nt-%d", uniq), cfg).Scan(&ntID); err != nil {
-		t.Fatalf("insert notification_template: %v", err)
+		`INSERT INTO teams (organization_id,name) VALUES ($1,$2) RETURNING id`,
+		orgID, name,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert team: %v", err)
 	}
+	return id
+}
 
-	var wtID int64
-	if err := db.QueryRow(`INSERT INTO workflow_templates (organization_id, name) VALUES ($1,$2) RETURNING id`,
-		orgID, fmt.Sprintf("wf-notif-wt-%d", uniq)).Scan(&wtID); err != nil {
-		t.Fatalf("insert workflow_template: %v", err)
+func insertNotificationTarget(
+	t *testing.T,
+	db *sqlx.DB,
+	orgID int64,
+	name string,
+	targetType string,
+	config string,
+) int64 {
+	t.Helper()
+	var id int64
+	if err := db.QueryRow(`
+		INSERT INTO notification_templates (organization_id,name,notification_type,config)
+		VALUES ($1,$2,$3,$4::jsonb)
+		RETURNING id`, orgID, name, targetType, config).Scan(&id); err != nil {
+		t.Fatalf("insert notification target: %v", err)
 	}
-	if _, err := db.Exec(
-		`INSERT INTO workflow_nodes
-		 (workflow_template_id, node_key, node_type, name, approval_timeout_seconds, approval_timeout_action)
-		 VALUES ($1,'gate','approval','the gate',86400,'rejected')`, wtID); err != nil {
-		t.Fatalf("insert approval node: %v", err)
-	}
-	var assignedTeamID, otherTeamID int64
-	if err := db.QueryRow(`INSERT INTO teams (organization_id,name) VALUES ($1,$2) RETURNING id`, orgID, fmt.Sprintf("wf-notif-team-%d", uniq)).Scan(&assignedTeamID); err != nil {
-		t.Fatalf("insert assigned team: %v", err)
-	}
-	if err := db.QueryRow(`INSERT INTO teams (organization_id,name) VALUES ($1,$2) RETURNING id`, orgID, fmt.Sprintf("wf-notif-other-team-%d", uniq)).Scan(&otherTeamID); err != nil {
-		t.Fatalf("insert other team: %v", err)
-	}
-	for _, ev := range []string{"started", "success", "error", "approval", "approved", "denied", "timeout"} {
-		var teamID interface{}
-		if ev == "approval" || ev == "approved" || ev == "denied" || ev == "timeout" {
-			teamID = assignedTeamID
-		}
-		if _, err := db.Exec(`INSERT INTO notification_policies
-			(organization_id,team_id,notification_template_id,resource_type,resource_id,event)
-			VALUES ($1,$2,$3,'workflow_template',$4,$5)`, orgID, teamID, ntID, wtID, ev); err != nil {
-			t.Fatalf("attach %s notification: %v", ev, err)
-		}
-	}
-	// A policy for another team must never receive the assigned team's approval.
-	if _, err := db.Exec(`INSERT INTO notification_policies
-		(organization_id,team_id,notification_template_id,resource_type,resource_id,event)
-		VALUES ($1,$2,$3,'workflow_template',$4,'approval')`, orgID, otherTeamID, ntID, wtID); err != nil {
-		t.Fatalf("attach other-team approval notification: %v", err)
-	}
+	return id
+}
 
-	// seen records every delivery (event -> kind). expect drains until the wanted
-	// event has been seen, recording others along the way (events from two runs
-	// share the channel, and 'started'/'approval' recur).
-	seen := map[string]string{}
-	expect := func(t *testing.T, wantEvent, wantKind string) {
-		t.Helper()
-		for {
-			if k, ok := seen[wantEvent]; ok {
-				if k != wantKind {
-					t.Fatalf("%s delivered with kind=%q, want %q", wantEvent, k, wantKind)
-				}
-				return
-			}
-			select {
-			case m := <-got:
-				ev, _ := m["event"].(string)
-				kind, _ := m["kind"].(string)
-				seen[ev] = kind
-			case <-time.After(3 * time.Second):
-				t.Fatalf("timed out waiting for %q notification (seen=%v)", wantEvent, seen)
-			}
+func insertApprovalWorkflowTemplate(
+	t *testing.T,
+	db *sqlx.DB,
+	orgID int64,
+	name string,
+	nodeKeys ...string,
+) int64 {
+	t.Helper()
+	var id int64
+	if err := db.QueryRow(
+		`INSERT INTO workflow_templates (organization_id,name) VALUES ($1,$2) RETURNING id`,
+		orgID, name,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert workflow template: %v", err)
+	}
+	for _, nodeKey := range nodeKeys {
+		if _, err := db.Exec(`
+			INSERT INTO workflow_nodes (
+				workflow_template_id,node_key,node_type,name,
+				approval_timeout_seconds,approval_timeout_action
+			)
+			VALUES ($1,$2,'approval',$2,86400,'rejected')`, id, nodeKey); err != nil {
+			t.Fatalf("insert approval node %q: %v", nodeKey, err)
 		}
 	}
-	advance := func(t *testing.T, wjID int64, phase string) {
-		t.Helper()
-		if err := sched.advanceWorkflow(ctx, wjID); err != nil {
-			t.Fatalf("advanceWorkflow (%s): %v", phase, err)
-		}
-	}
+	return id
+}
 
-	// --- Approve path: started + approval, then approved + success. ---
-	wjA, err := launch.Workflow(ctx, db, wtID, launch.Options{})
-	if err != nil {
-		t.Fatalf("launch.Workflow A: %v", err)
-	}
-	if _, err := db.Exec(`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`, assignedTeamID, wjA); err != nil {
-		t.Fatalf("assign workflow A approval team: %v", err)
-	}
-	advance(t, wjA, "A start")
-	expect(t, "started", "workflow")
-	expect(t, "approval", "workflow approval")
-
-	// Once-only: advancing again while the node is still awaiting approval must not
-	// re-deliver 'started' or 'approval' (the whole point of the watermarks).
-	advance(t, wjA, "A idle re-advance")
-	select {
-	case m := <-got:
-		t.Fatalf("duplicate notification on idle re-advance: %v", m)
-	case <-time.After(500 * time.Millisecond):
-	}
-
-	if _, err := db.Exec(`UPDATE workflow_job_nodes SET status='approved' WHERE workflow_job_id=$1 AND node_key='gate'`, wjA); err != nil {
-		t.Fatalf("approve node: %v", err)
-	}
-	advance(t, wjA, "A finalize")
-	expect(t, "approved", "workflow approval")
-	expect(t, "success", "workflow")
-	assertWFStatus(t, db, wjA, "successful")
-
-	// --- Deny path: a fresh run, then denied + error. (started/approval recur and
-	// are drained by expect.) ---
-	seen = map[string]string{} // reset so recurring started/approval are re-observed
-	wjB, err := launch.Workflow(ctx, db, wtID, launch.Options{})
-	if err != nil {
-		t.Fatalf("launch.Workflow B: %v", err)
-	}
-	if _, err := db.Exec(`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`, assignedTeamID, wjB); err != nil {
-		t.Fatalf("assign workflow B approval team: %v", err)
-	}
-	advance(t, wjB, "B start")
-	expect(t, "started", "workflow")
-	expect(t, "approval", "workflow approval")
-
-	if _, err := db.Exec(`UPDATE workflow_job_nodes SET status='rejected' WHERE workflow_job_id=$1 AND node_key='gate'`, wjB); err != nil {
-		t.Fatalf("deny node: %v", err)
-	}
-	advance(t, wjB, "B finalize")
-	expect(t, "denied", "workflow approval")
-	expect(t, "error", "workflow")
-	assertWFStatus(t, db, wjB, "failed")
-
-	// --- Timeout path: the platform's fixed 24-hour reject policy is copied into
-	// the run snapshot. Moving the durable waiting timestamp beyond that deadline
-	// lets the next scheduler tick reject it with no human decision actor. ---
-	seen = map[string]string{}
-	wjC, err := launch.Workflow(ctx, db, wtID, launch.Options{})
-	if err != nil {
-		t.Fatalf("launch.Workflow C: %v", err)
-	}
-	if _, err := db.Exec(`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`, assignedTeamID, wjC); err != nil {
-		t.Fatalf("assign workflow C approval team: %v", err)
-	}
-	advance(t, wjC, "C start")
-	expect(t, "started", "workflow")
-	expect(t, "approval", "workflow approval")
-	if _, err := db.Exec(`UPDATE workflow_job_nodes SET awaiting_since=now()-interval '25 hours' WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
-		t.Fatalf("age approval gate: %v", err)
-	}
-	advance(t, wjC, "C timeout")
-	expect(t, "timeout", "workflow approval")
-	expect(t, "error", "workflow")
-	assertWFStatus(t, db, wjC, "failed")
-	var audit struct {
-		Status    string     `db:"status"`
-		TimedOut  bool       `db:"timed_out"`
-		DecidedAt *time.Time `db:"decided_at"`
-		DecidedBy *int64     `db:"decided_by_user_id"`
-	}
-	if err := db.Get(&audit, `SELECT status,timed_out,decided_at,decided_by_user_id FROM workflow_job_nodes WHERE workflow_job_id=$1 AND node_key='gate'`, wjC); err != nil {
-		t.Fatalf("read timeout audit: %v", err)
-	}
-	if audit.Status != "rejected" || !audit.TimedOut || audit.DecidedAt == nil || audit.DecidedBy != nil {
-		t.Fatalf("unexpected timeout audit: %+v", audit)
+func insertNotificationPolicy(
+	t *testing.T,
+	db *sqlx.DB,
+	orgID int64,
+	teamID *int64,
+	targetID int64,
+	templateID int64,
+	event string,
+) {
+	t.Helper()
+	if _, err := db.Exec(`
+		INSERT INTO notification_policies (
+			organization_id,team_id,notification_template_id,
+			resource_type,resource_id,event
+		)
+		VALUES ($1,$2,$3,'workflow_template',$4,$5)`,
+		orgID, teamID, targetID, templateID, event); err != nil {
+		t.Fatalf("insert %s notification policy: %v", event, err)
 	}
 }
 
-func assertWFStatus(t *testing.T, db *sqlx.DB, wjID int64, want string) {
+func launchNotificationWorkflow(
+	t *testing.T,
+	ctx context.Context,
+	db *sqlx.DB,
+	templateID int64,
+	teamID int64,
+) int64 {
 	t.Helper()
-	var status string
-	if err := db.Get(&status, `SELECT status FROM workflow_jobs WHERE id=$1`, wjID); err != nil {
+	runID, err := launch.Workflow(ctx, db, templateID, launch.Options{})
+	if err != nil {
+		t.Fatalf("launch workflow: %v", err)
+	}
+	if _, err := db.Exec(
+		`UPDATE workflow_jobs SET approval_team_id=$1 WHERE id=$2`,
+		teamID, runID,
+	); err != nil {
+		t.Fatalf("assign approval team: %v", err)
+	}
+	return runID
+}
+
+func advanceNotificationWorkflow(
+	t *testing.T,
+	scheduler *Scheduler,
+	ctx context.Context,
+	runID int64,
+	phase string,
+) {
+	t.Helper()
+	if err := scheduler.advanceWorkflow(ctx, runID); err != nil {
+		t.Fatalf("advance workflow (%s): %v", phase, err)
+	}
+}
+
+func assertDeliveryCount(
+	t *testing.T,
+	db *sqlx.DB,
+	runID int64,
+	event string,
+	teamID *int64,
+	want int,
+) {
+	t.Helper()
+	var got int
+	if err := db.Get(&got, `
+		SELECT count(*)
+		FROM notification_deliveries
+		WHERE subject_id=$1
+		  AND event=$2
+		  AND team_id IS NOT DISTINCT FROM $3`, runID, event, teamID); err != nil {
+		t.Fatalf("count %s deliveries: %v", event, err)
+	}
+	if got != want {
+		t.Fatalf("%s deliveries for team %v = %d, want %d", event, teamID, got, want)
+	}
+}
+
+func assertDistinctOccurrences(
+	t *testing.T,
+	db *sqlx.DB,
+	runID int64,
+	event string,
+	want int,
+) {
+	t.Helper()
+	var got int
+	if err := db.Get(&got, `
+		SELECT count(DISTINCT occurrence_id)
+		FROM notification_deliveries
+		WHERE subject_id=$1 AND event=$2`, runID, event); err != nil {
+		t.Fatalf("count distinct %s occurrences: %v", event, err)
+	}
+	if got != want {
+		t.Fatalf("distinct %s occurrences=%d, want %d", event, got, want)
+	}
+}
+
+func assertWorkflowStatus(t *testing.T, db *sqlx.DB, runID int64, want string) {
+	t.Helper()
+	var got string
+	if err := db.Get(&got, `SELECT status FROM workflow_jobs WHERE id=$1`, runID); err != nil {
 		t.Fatalf("read workflow status: %v", err)
 	}
-	if status != want {
-		t.Fatalf("workflow %d status = %q, want %q", wjID, status, want)
+	if got != want {
+		t.Fatalf("workflow %d status=%q, want %q", runID, got, want)
 	}
 }

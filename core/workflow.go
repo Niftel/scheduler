@@ -114,7 +114,7 @@ func wfEdgeFires(edgeType, parentState string) bool {
 // in nodeStarters keyed by node_type; a node with no registered starter falls
 // through to the default job-launch path in advanceWorkflow. Table-ifying the old
 // if/else ladder (B9/#88) makes adding a node type a single map entry.
-type nodeStarter func(s *Scheduler, ctx context.Context, wfName string, wjID int64, n *wfNode)
+type nodeStarter func(s *Scheduler, ctx context.Context, wfName string, wjID int64, n *wfNode) error
 
 var nodeStarters = map[string]nodeStarter{
 	"approval":    (*Scheduler).startApprovalNode,
@@ -122,32 +122,37 @@ var nodeStarters = map[string]nodeStarter{
 	"webhook_out": (*Scheduler).startWebhookOutNode,
 }
 
-// startApprovalNode pauses the node until a user approves/denies it, and fires the
-// workflow template's 'approval' notifications so approvers know to act. The node
-// transitions pending->awaiting_approval exactly once, so the notification is sent
-// once.
-func (s *Scheduler) startApprovalNode(ctx context.Context, _ string, wjID int64, n *wfNode) {
-	logExec(ctx, s.DB, `UPDATE workflow_job_nodes SET status='awaiting_approval' WHERE id=$1`, n.ID)
-	n.Status = "awaiting_approval"
-	s.notifyWorkflow(wjID, "approval", "needs approval")
+// startApprovalNode pauses the node until a user approves/denies it and enqueues
+// the workflow template's 'approval' deliveries so approvers know to act. The
+// node transition and durable enqueue commit together.
+func (s *Scheduler) startApprovalNode(ctx context.Context, _ string, wjID int64, n *wfNode) error {
+	changed, err := s.beginApproval(ctx, wjID, n.ID)
+	if err != nil {
+		return err
+	}
+	if changed {
+		n.Status = "awaiting_approval"
+	}
+	return nil
 }
 
 // startWebhookInNode pauses until an external caller hits the node's callback with
 // its per-run event_token. The token is minted now so the run detail can surface
 // the callback URL for whoever needs to release it.
-func (s *Scheduler) startWebhookInNode(ctx context.Context, _ string, wjID int64, n *wfNode) {
+func (s *Scheduler) startWebhookInNode(ctx context.Context, _ string, wjID int64, n *wfNode) error {
 	token := newEventToken()
 	logExec(ctx, s.DB,
 		`UPDATE workflow_job_nodes SET status='awaiting_event', event_token=$1 WHERE id=$2`, token, n.ID)
 	n.Status = "awaiting_event"
 	n.EventToken = token
 	logger.Info("workflow node awaiting remote event", "workflow_id", wjID, "node", n.NodeKey)
+	return nil
 }
 
 // startWebhookOutNode POSTs to the configured URL and continues immediately. A 2xx
 // (or 3xx) is success; anything else — or a missing/failed request — fails the node
 // so its failure edges fire.
-func (s *Scheduler) startWebhookOutNode(ctx context.Context, wfName string, wjID int64, n *wfNode) {
+func (s *Scheduler) startWebhookOutNode(ctx context.Context, wfName string, wjID int64, n *wfNode) error {
 	newSt := "successful"
 	if !postWorkflowWebhook(n.WebhookURL, n.WebhookBody, wfName, wjID, n.NodeKey) {
 		newSt = "failed"
@@ -155,6 +160,7 @@ func (s *Scheduler) startWebhookOutNode(ctx context.Context, wfName string, wjID
 	logExec(ctx, s.DB, `UPDATE workflow_job_nodes SET status=$1 WHERE id=$2`, newSt, n.ID)
 	n.Status = newSt
 	logger.Info("workflow node webhook_out", "workflow_id", wjID, "node", n.NodeKey, "status", newSt)
+	return nil
 }
 
 func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
@@ -175,14 +181,9 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 	// extra_vars semantics.
 	wfOpts := launch.ParseArgs(wf.LaunchArgs)
 
-	// Fire the 'started' notification the first time this run is advanced. The
-	// atomic claim (started_notified false->true) makes it exactly-once on its own,
-	// independent of the advisory lock.
-	if res, err := s.DB.ExecContext(ctx,
-		`UPDATE workflow_jobs SET started_notified=true WHERE id=$1 AND started_notified=false`, wjID); err == nil {
-		if rows, _ := res.RowsAffected(); rows == 1 {
-			s.notifyWorkflow(wjID, "started", "started")
-		}
+	// Atomically claim the first advancement and enqueue its durable delivery.
+	if err := s.markWorkflowStarted(ctx, wjID); err != nil {
+		return err
 	}
 
 	// Read the run's snapshotted graph — not the template — so editing the template
@@ -241,17 +242,12 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		if n.NodeType != "approval" || n.Status != "awaiting_approval" || n.ApprovalTimeoutSeconds <= 0 {
 			continue
 		}
-		result, err := s.DB.ExecContext(ctx, `
-			UPDATE workflow_job_nodes
-			SET status=approval_timeout_action, timed_out=true
-			WHERE id=$1 AND status='awaiting_approval'
-			  AND awaiting_since + make_interval(secs => approval_timeout_seconds) <= now()`, n.ID)
+		status, changed, err := s.expireApproval(ctx, wjID, n.ID)
 		if err != nil {
-			logger.Error("workflow approval timeout failed", "workflow_id", wjID, "node", n.NodeKey, "err", err)
-			continue
+			return err
 		}
-		if changed, _ := result.RowsAffected(); changed == 1 {
-			n.Status = n.ApprovalTimeoutAction
+		if changed {
+			n.Status = status
 			n.TimedOut = true
 			logger.Info("workflow approval timed out", "workflow_id", wjID, "node", n.NodeKey, "outcome", n.Status)
 		}
@@ -266,19 +262,17 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		if n.NodeType != "approval" || (n.Status != "approved" && n.Status != "rejected") {
 			continue
 		}
-		res, err := s.DB.ExecContext(ctx,
-			`UPDATE workflow_job_nodes SET outcome_notified=true WHERE id=$1 AND outcome_notified=false`, n.ID)
-		if err != nil {
-			continue
+		event := "denied"
+		if n.TimedOut {
+			// Normally expireApproval already committed this timeout occurrence
+			// and watermark. Still attempt the conditional claim so a timeout
+			// persisted by an older scheduler is recovered after upgrade/restart.
+			event = "timeout"
+		} else if n.Status == "approved" {
+			event = "approved"
 		}
-		if rows, _ := res.RowsAffected(); rows == 1 {
-			if n.TimedOut {
-				s.notifyWorkflow(wjID, "timeout", "timed out")
-			} else if n.Status == "approved" {
-				s.notifyWorkflow(wjID, "approved", "approved")
-			} else {
-				s.notifyWorkflow(wjID, "denied", "denied")
-			}
+		if _, err := s.markApprovalOutcome(ctx, wjID, n.ID, event); err != nil {
+			return err
 		}
 	}
 
@@ -317,7 +311,9 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		// registered starters (nodeStarters); anything else falls through to the
 		// default job-launch path below. Adding a node type is one map entry.
 		if start, ok := nodeStarters[n.NodeType]; ok {
-			start(s, ctx, wf.Name, wjID, n)
+			if err := start(s, ctx, wf.Name, wjID, n); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -384,17 +380,12 @@ func (s *Scheduler) advanceWorkflow(ctx context.Context, wjID int64) error {
 		} else if anyFail {
 			status = "failed"
 		}
-		logExec(ctx, s.DB, `UPDATE workflow_jobs SET status=$1, finished_at=now() WHERE id=$2`, status, wjID)
-		logger.Info("workflow finished", "workflow_id", wjID, "status", status)
-		// Fire the workflow template's terminal-state notifications. This block runs
-		// exactly once per run (processWorkflows only picks up status='running'), so
-		// there is no dedup to do.
-		if status == "successful" {
-			s.notifyWorkflow(wjID, "success", "succeeded")
-		} else if status == "canceled" {
-			s.notifyWorkflow(wjID, "error", "was canceled")
-		} else {
-			s.notifyWorkflow(wjID, "error", "failed")
+		changed, err := s.finishWorkflow(ctx, wjID, status)
+		if err != nil {
+			return err
+		}
+		if changed {
+			logger.Info("workflow finished", "workflow_id", wjID, "status", status)
 		}
 	}
 	return nil
