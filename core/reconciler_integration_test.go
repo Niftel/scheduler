@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -9,7 +10,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"github.com/praetordev/events"
 )
+
+type recordingEventPublisher struct {
+	events []events.JobEvent
+}
+
+func (p *recordingEventPublisher) PublishExecutionRequest(*events.ExecutionRequest) error { return nil }
+func (p *recordingEventPublisher) PublishJobEvent(event *events.JobEvent) error {
+	p.events = append(p.events, *event)
+	return nil
+}
 
 // TestReconcilerHeartbeatAware proves the reconciler is heartbeat-aware and, for
 // LOCAL runs, recovery-aware (#45):
@@ -107,6 +119,31 @@ func TestReconcilerHeartbeatAware(t *testing.T) {
 	}
 	if got := jobStatus(t, db, lostJob); got != "error" {
 		t.Fatalf("lost job status = %q, want error", got)
+	}
+	var eventOutboxCount int
+	if err := db.Get(&eventOutboxCount, `
+		SELECT count(*) FROM job_event_outbox
+		WHERE execution_run_id = $1 AND event_type = 'JOB_FAILED'
+		  AND payload->>'unified_job_id' = $2`, lostRun, fmt.Sprint(lostJob)); err != nil {
+		t.Fatalf("get lost-run event outbox: %v", err)
+	}
+	if eventOutboxCount != 1 {
+		t.Fatalf("lost run terminal outbox rows = %d, want 1", eventOutboxCount)
+	}
+	publisher := &recordingEventPublisher{}
+	sched.Publisher = publisher
+	if err := sched.relayJobEventOutbox(context.Background()); err != nil {
+		t.Fatalf("relay lost-run event: %v", err)
+	}
+	if len(publisher.events) != 1 || publisher.events[0].ExecutionRunID != lostRun || publisher.events[0].EventType != "JOB_FAILED" {
+		t.Fatalf("published lost-run events = %#v, want one JOB_FAILED for %s", publisher.events, lostRun)
+	}
+	var eventOutboxStatus string
+	if err := db.Get(&eventOutboxStatus, `SELECT status FROM job_event_outbox WHERE execution_run_id = $1`, lostRun); err != nil {
+		t.Fatalf("get lost-run event outbox status: %v", err)
+	}
+	if eventOutboxStatus != "sent" {
+		t.Fatalf("lost-run event outbox status = %q, want sent", eventOutboxStatus)
 	}
 }
 

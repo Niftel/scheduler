@@ -69,6 +69,7 @@ func (s *Scheduler) tickTasks() []tickTask {
 	return []tickTask{
 		{"pending_jobs", s.processPendingJobs},
 		{"relay_outbox", s.relayOutbox},
+		{"relay_job_event_outbox", s.relayJobEventOutbox},
 		{"schedules", s.processSchedules},
 		{"timeouts", s.processTimedOutJobs},
 		{"workflows", func(ctx context.Context) error { s.processWorkflows(ctx); return nil }},
@@ -310,6 +311,55 @@ func (s *Scheduler) relayOutbox(ctx context.Context) error {
 	return nil
 }
 
+// relayJobEventOutbox publishes scheduler-synthesized terminal events. The
+// database transition and outbox insert commit together; consumer projection
+// remains idempotent on (execution_run_id, seq), so a publish repeated after a
+// relay crash cannot duplicate state changes or notifications.
+func (s *Scheduler) relayJobEventOutbox(ctx context.Context) error {
+	if _, err := s.DB.ExecContext(ctx, `
+		UPDATE job_event_outbox SET status = 'pending'
+		WHERE status = 'sending' AND sent_at < now() - interval '2 minutes'`); err != nil {
+		return fmt.Errorf("recover stale job event outbox claims: %w", err)
+	}
+
+	type outboxRow struct {
+		ID      int64           `db:"id"`
+		Payload json.RawMessage `db:"payload"`
+	}
+	var rows []outboxRow
+	if err := s.DB.SelectContext(ctx, &rows, `
+		UPDATE job_event_outbox SET status = 'sending', sent_at = now()
+		WHERE id IN (
+			SELECT id FROM job_event_outbox
+			WHERE status = 'pending'
+			ORDER BY id
+			FOR UPDATE SKIP LOCKED
+			LIMIT 50
+		)
+		RETURNING id, payload`); err != nil {
+		return fmt.Errorf("claim job event outbox rows: %w", err)
+	}
+
+	for _, row := range rows {
+		var event events.JobEvent
+		if err := json.Unmarshal(row.Payload, &event); err != nil {
+			logger.Error("job event outbox: dropping unparseable row", "row_id", row.ID, "err", err)
+			logExec(ctx, s.DB, `UPDATE job_event_outbox SET status = 'failed', attempts = attempts + 1 WHERE id = $1`, row.ID)
+			continue
+		}
+		if err := s.Publisher.PublishJobEvent(&event); err != nil {
+			logger.Error("job event outbox: publish failed (will retry)", "row_id", row.ID, "err", err)
+			logExec(ctx, s.DB, `UPDATE job_event_outbox SET status = 'pending', attempts = attempts + 1 WHERE id = $1`, row.ID)
+			continue
+		}
+		if _, err := s.DB.ExecContext(ctx, `
+			UPDATE job_event_outbox SET status = 'sent', sent_at = now(), attempts = attempts + 1 WHERE id = $1`, row.ID); err != nil {
+			logger.Error("job event outbox: published row but failed to mark sent", "row_id", row.ID, "err", err)
+		}
+	}
+	return nil
+}
+
 func (s *Scheduler) processSchedules(ctx context.Context) error {
 	// Transaction
 	tx, err := s.DB.BeginTxx(ctx, nil)
@@ -474,6 +524,73 @@ func durationEnv(key string, def time.Duration) time.Duration {
 	return def
 }
 
+// markLostLocalRuns commits the provisional lost/error verdict together with a
+// durable JOB_FAILED event. The consumer can therefore project the final failed
+// state and dispatch job-template notifications even if NATS is unavailable at
+// the instant the recovery deadline expires.
+func (s *Scheduler) markLostLocalRuns(ctx context.Context) (int64, error) {
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	type lostRun struct {
+		RunID uuid.UUID `db:"id"`
+		JobID int64     `db:"unified_job_id"`
+		Seq   int64     `db:"seq"`
+	}
+	var runs []lostRun
+	if err := tx.SelectContext(ctx, &runs, `
+		SELECT er.id, er.unified_job_id,
+		       GREATEST(er.last_event_seq, COALESCE((
+		         SELECT max(je.seq) FROM job_events je WHERE je.execution_run_id = er.id
+		       ), 0)) + 1 AS seq
+		FROM execution_runs er
+		JOIN unified_jobs uj ON uj.id = er.unified_job_id
+		WHERE er.state = 'reconciling' AND er.runner_host_id IS NULL
+		  AND er.reconcile_after IS NOT NULL AND er.reconcile_after < now()
+		  AND uj.status NOT IN ('successful', 'failed', 'canceled')
+		FOR UPDATE OF er, uj SKIP LOCKED`); err != nil {
+		return 0, fmt.Errorf("select lost local runs: %w", err)
+	}
+
+	for _, run := range runs {
+		now := time.Now().UTC()
+		event := events.JobEvent{
+			ExecutionRunID: run.RunID,
+			UnifiedJobID:   run.JobID,
+			Seq:            run.Seq,
+			EventType:      "JOB_FAILED",
+			Timestamp:      now,
+		}
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return 0, fmt.Errorf("marshal lost-run terminal event: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE execution_runs
+			SET state = 'lost', finished_at = $2, last_event_seq = GREATEST(last_event_seq, $3)
+			WHERE id = $1`, run.RunID, now, run.Seq); err != nil {
+			return 0, fmt.Errorf("mark local run lost: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE unified_jobs SET status = 'error', finished_at = $2 WHERE id = $1`, run.JobID, now); err != nil {
+			return 0, fmt.Errorf("mark lost local job errored: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO job_event_outbox (execution_run_id, event_type, payload)
+			VALUES ($1, $2, $3)`, run.RunID, event.EventType, payload); err != nil {
+			return 0, fmt.Errorf("enqueue lost-run terminal event: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(runs)), nil
+}
+
 // This catches cases where the host-runner crashes silently without sending events.
 func (s *Scheduler) processTimedOutJobs(ctx context.Context) error {
 	// Heartbeat-aware reconciliation. A long-running job is NOT failed merely for
@@ -544,22 +661,10 @@ func (s *Scheduler) processTimedOutJobs(ctx context.Context) error {
 	// 1c. True loss: a local run still in 'reconciling' past its recovery deadline
 	// was never resumed (executor gone for good / WAL unrecoverable). Now declare
 	// it lost and its job errored — the delayed form of the old 1b semantics.
-	result, err := s.DB.ExecContext(ctx, `
-		WITH lost AS (
-			UPDATE execution_runs er
-			SET state = 'lost', finished_at = now()
-			WHERE er.state = 'reconciling' AND er.runner_host_id IS NULL
-			  AND er.reconcile_after IS NOT NULL AND er.reconcile_after < now()
-			RETURNING er.unified_job_id
-		)
-		UPDATE unified_jobs uj
-		SET status = 'error', finished_at = now()
-		FROM lost
-		WHERE uj.id = lost.unified_job_id
-		  AND uj.status NOT IN ('successful', 'failed', 'canceled', 'error')`)
+	rows, err := s.markLostLocalRuns(ctx)
 	if err != nil {
 		logger.Error("reconcile lost local runs failed", "err", err)
-	} else if rows, _ := result.RowsAffected(); rows > 0 {
+	} else if rows > 0 {
 		RunsLost.Add(float64(rows))
 		logger.Warn("marked local runs as lost (recovery deadline passed)", "count", rows)
 	}
@@ -590,7 +695,7 @@ func (s *Scheduler) processTimedOutJobs(ctx context.Context) error {
 	// 2b. A queued job with NO runner host was never dispatched to a target (a
 	// genuine stuck-in-queue). With the durable outbox this is rare, but it's a safety
 	// net and is safe to fail — there is no host holding a hidden outcome.
-	result, err = s.DB.ExecContext(ctx, `
+	result, err := s.DB.ExecContext(ctx, `
 		WITH stuck AS (
 			UPDATE unified_jobs uj
 			SET status = 'failed', finished_at = now()
