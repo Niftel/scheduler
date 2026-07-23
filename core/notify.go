@@ -8,8 +8,8 @@ import (
 	"github.com/praetordev/notify"
 )
 
-// notifyWorkflow fires a workflow template's attached notifications for a
-// lifecycle event (success | error | approval). Everything is resolved from the
+// notifyWorkflow fires a workflow template's scoped notification policies for a
+// lifecycle event. Everything is resolved from the
 // run id, so callers pass only the workflow_job id, the event, and a human verb.
 //
 // Workflow notifications are dispatched here (not by the consumer, which projects
@@ -33,9 +33,17 @@ func (s *Scheduler) notifyWorkflow(wjID int64, event, verb string) {
 			SELECT nt.notification_type, nt.config, wt.name
 			FROM workflow_jobs wj
 			JOIN workflow_templates wt ON wt.id = wj.workflow_template_id
-			JOIN workflow_template_notifications wtn ON wtn.workflow_template_id = wt.id AND wtn.event = $2
-			JOIN notification_templates nt ON nt.id = wtn.notification_template_id
-			WHERE wj.id = $1`, wjID, event); err != nil {
+			JOIN notification_policies np
+			  ON np.resource_type = 'workflow_template'
+			 AND np.resource_id = wt.id
+			 AND np.event = $2
+			JOIN notification_templates nt ON nt.id = np.notification_template_id
+			WHERE wj.id = $1
+			  AND (
+			    ($2 IN ('approval','approved','denied','timeout') AND np.team_id = wj.approval_team_id)
+			    OR
+			    ($2 NOT IN ('approval','approved','denied','timeout') AND np.team_id IS NULL)
+			  )`, wjID, event); err != nil {
 			logger.Error("workflow notifier lookup failed", "workflow_id", wjID, "event", event, "err", err)
 			return
 		}
