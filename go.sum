@@ -63,6 +63,8 @@ github.com/praetordev/events v0.1.2-0.20260721152035-6660ddd52b3a h1:Lk47yKK/YU8
 github.com/praetordev/events v0.1.2-0.20260721152035-6660ddd52b3a/go.mod h1:gF7ZeKJTxupPc1yPlo8HBhRdzZrRWkBbTEovgba498Y=
 github.com/praetordev/launch v0.1.2-0.20260721152036-bccc41205bc4 h1:UVfvn7Prv8hcXvBH1MBIn24ojNxwqr+P0V77c7J8Xjg=
 github.com/praetordev/launch v0.1.2-0.20260721152036-bccc41205bc4/go.mod h1:rCG3gRZUpzZkIC+avzl2skhOJAgPTovXtYLcxr7eCBA=
+github.com/praetordev/launch v0.1.2-0.20260726123207-598b3d64f927 h1:3JWULRFnXiQIo6Gz/bhTt6yefy5pJuBQHbQcAV9W4Yk=
+github.com/praetordev/launch v0.1.2-0.20260726123207-598b3d64f927/go.mod h1:rCG3gRZUpzZkIC+avzl2skhOJAgPTovXtYLcxr7eCBA=
 github.com/praetordev/metrics v0.1.0 h1:P6uRYZOVIsIw6XKjr+cg/mZ7tV9GuOOfcAeL/zJYtlw=
 github.com/praetordev/metrics v0.1.0/go.mod h1:LWAc9ODqqUtnFJpTwmXFkmP47OlyyhYM6WA3ff9dKws=
 github.com/praetordev/models v0.2.1 h1:+Zn+2ayyOOohXDjfL9m8e9ogoKs+hIb/tVjcgO1zKqM=

@@ -161,7 +161,8 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 		// (no template) and ordinary template jobs each have their own read-only
 		// builder in manifest.go; both return the ids we snapshot on the run below.
 		var manifest events.JobManifest
-		var runnerHostID, credID int64
+		var runnerHostID int64
+		var credential credentialSnapshot
 		jobOpts := launch.ParseArgs(job.JobArgs)
 		if srcID := jobOpts.InventorySourceID; srcID > 0 {
 			m, cred, berr := s.buildSyncManifest(ctx, tx, srcID, jobOpts.InventoryPreview)
@@ -170,7 +171,8 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 				logExec(ctx, tx, "UPDATE unified_jobs SET status='failed' WHERE id=$1", job.ID)
 				continue
 			}
-			manifest, credID = m, cred
+			manifest = m
+			credential.ID = cred
 		} else {
 			if job.UnifiedJobTemplateID == nil {
 				logger.Warn("job has no template - skipping (template required)", "job_id", job.ID)
@@ -183,7 +185,7 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 				logExec(ctx, tx, "UPDATE unified_jobs SET status = 'failed' WHERE id = $1", job.ID)
 				continue
 			}
-			manifest, runnerHostID, credID = m, rh, cred
+			manifest, runnerHostID, credential = m, rh, cred
 		}
 
 		// Snapshot the resolved runner host + credential onto the run: the
@@ -196,24 +198,9 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 				logger.Error("snapshot runner_host_id failed", "job_id", job.ID, "err", err)
 			}
 		}
-		if credID != 0 {
-			if s.SecretsIntegration {
-				var serviceID *uuid.UUID
-				var serviceVersion *int64
-				if err := tx.QueryRowxContext(ctx, `SELECT secrets_service_id, secrets_service_version FROM credentials WHERE id = $1`, credID).Scan(&serviceID, &serviceVersion); err != nil {
-					return fmt.Errorf("read secrets-service reference for credential %d: %w", credID, err)
-				}
-				if serviceID == nil || serviceVersion == nil || *serviceVersion <= 0 {
-					return fmt.Errorf("credential %d is not managed by the secrets service", credID)
-				}
-				if _, err := tx.ExecContext(ctx, `UPDATE execution_runs
-					SET credential_id = $1, secrets_credential_id = $2, secrets_credential_version = $3 WHERE id = $4`,
-					credID, *serviceID, *serviceVersion, runID); err != nil {
-					return fmt.Errorf("snapshot secrets-service credential on run: %w", err)
-				}
-			} else if _, err := tx.ExecContext(ctx,
-				`UPDATE execution_runs SET credential_id = $1 WHERE id = $2`, credID, runID); err != nil {
-				return fmt.Errorf("snapshot credential id on run: %w", err)
+		if credential.ID != 0 {
+			if err := s.snapshotRunCredential(ctx, tx, runID, credential); err != nil {
+				return err
 			}
 		}
 
@@ -247,6 +234,40 @@ func (s *Scheduler) processPendingJobs(ctx context.Context) error {
 		return err
 	}
 	JobsDispatched.Add(float64(len(jobs)))
+	return nil
+}
+
+func (s *Scheduler) snapshotRunCredential(ctx context.Context, tx *sqlx.Tx, runID uuid.UUID, credential credentialSnapshot) error {
+	if !s.SecretsIntegration {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE execution_runs SET credential_id = $1 WHERE id = $2`, credential.ID, runID); err != nil {
+			return fmt.Errorf("snapshot credential id on run: %w", err)
+		}
+		return nil
+	}
+
+	var serviceID *uuid.UUID
+	var serviceVersion *int64
+	if credential.Immutable {
+		parsedID, err := uuid.Parse(credential.SecretsID)
+		if err != nil || credential.SecretsVersion <= 0 {
+			return fmt.Errorf("immutable credential %d has an invalid secrets-service reference", credential.ID)
+		}
+		serviceID = &parsedID
+		serviceVersion = &credential.SecretsVersion
+	} else if err := tx.QueryRowxContext(ctx,
+		`SELECT secrets_service_id, secrets_service_version FROM credentials WHERE id = $1`,
+		credential.ID).Scan(&serviceID, &serviceVersion); err != nil {
+		return fmt.Errorf("read secrets-service reference for credential %d: %w", credential.ID, err)
+	}
+	if serviceID == nil || serviceVersion == nil || *serviceVersion <= 0 {
+		return fmt.Errorf("credential %d is not managed by the secrets service", credential.ID)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE execution_runs
+		SET credential_id = $1, secrets_credential_id = $2, secrets_credential_version = $3 WHERE id = $4`,
+		credential.ID, *serviceID, *serviceVersion, runID); err != nil {
+		return fmt.Errorf("snapshot secrets-service credential on run: %w", err)
+	}
 	return nil
 }
 

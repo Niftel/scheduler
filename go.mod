@@ -13,7 +13,7 @@ require (
 	github.com/praetordev/env v0.1.0
 	github.com/praetordev/eventbus v0.1.0
 	github.com/praetordev/events v0.1.2-0.20260721152035-6660ddd52b3a
-	github.com/praetordev/launch v0.1.2-0.20260721152036-bccc41205bc4
+	github.com/praetordev/launch v0.1.2-0.20260726123207-598b3d64f927
 	github.com/praetordev/metrics v0.1.0
 	github.com/praetordev/models v0.2.1
 	github.com/praetordev/objectstore v0.1.1
